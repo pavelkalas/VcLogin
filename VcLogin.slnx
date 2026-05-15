@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="VcLogin/VcLogin.vcxproj" Id="bb0e1c66-76fa-4d5f-a3dc-0161fd607b5d" />
+</Solution>
