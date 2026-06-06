@@ -1,5 +1,5 @@
 // ============================================================================
-// VcLogin v4.8 – Vietcong 1 autentizace
+// VcLogin v5.1 – Vietcong 1 autentizace
 // Autor: Pavel Kalaš (Floxen)
 // ============================================================================
 
@@ -26,6 +26,7 @@
 #include <atomic>
 #include <thread>
 #include <cstdarg>
+using namespace std;
 
 // ============================================================================
 // Forward deklarace
@@ -38,6 +39,8 @@ class  PlayerDatabase;
 class  CommandHandler;
 class  PlayerConnectionWatcher;
 class  MessageManager;
+
+PlayerConnectionWatcher* g_playerConnectionWatcher = nullptr;
 
 // ============================================================================
 // Konstanty – soubory
@@ -66,11 +69,13 @@ using OnMessage_t = int(__cdecl*)(int, int);
 using OnMessageRender_t = void(__stdcall*)(int, wchar_t*, int, int, int);
 using WriteBitsAligned_t = void(__cdecl*)(void*, unsigned int*, const void*, int);
 using SendMessageToRemoteClient_t = void(__cdecl*)(int, void*, int, int, int);
+using OnPlayerCreate_t = DWORD * (__cdecl*)(int*, int);
 
 OnMessage_t                 OriginalOnMessage = nullptr;
 OnMessageRender_t           OriginalOnMessageRender = nullptr;
 WriteBitsAligned_t          WriteBitsAligned = nullptr;
 SendMessageToRemoteClient_t SendMessageToRemoteClient = nullptr;
+OnPlayerCreate_t OnPlayerCreate = nullptr;
 
 using GetClientAddress_t = BOOL(__cdecl*)(void*, int, int);
 GetClientAddress_t GetClientAddress = nullptr;
@@ -162,15 +167,14 @@ void CreateDefaultConfigIfMissing() {
 	if (FileExists(CONFIG_FILE)) return;
 	std::ofstream cfg(CONFIG_FILE);
 	if (!cfg.is_open()) return;
-	cfg << "; VcLogin v4.8 by Floxen\n"
+	cfg << "; VcLogin v5.1 by Floxen\n"
 		<< "; discord: swipesznx6\n"
 		<< "; web: https://pavelkalas.cz\n\n"
-		<< "database_file = players.dat\n"
+		<< "database_file = players.db\n"
 		<< "custom_message = Hello, world!\n"
 		<< "min_password_length = 6\n"
 		<< "max_password_length = 32\n"
 		<< "max_password_tries_per_connection = 3\n"
-		<< "tries_penalty_level = kick\n"
 		<< "chat_cooldown_time = 2\n"
 		<< "guest_mode = 1\n"
 		<< "guest_mode_join_spawn_delay = 10\n"
@@ -347,7 +351,6 @@ public:
 		MSG_ALREADY_LOGGED,
 		MSG_DUPLICATE_NAME,
 		MSG_SPECTATOR_NO_LOGIN,
-		MSG_MAP_CHANGING_KICK,
 		MSG_LOGIN_TIMEOUT,
 		MSG_ADMIN_ONLY,
 		MSG_CUSTOM_INFO,
@@ -364,7 +367,6 @@ public:
 		MSG_IP_CHANGED,
 		MSG_CHAT_COOLDOWN,
 		MSG_RECOVERY_NOT_IMPL,
-		MSG_HELP_TEXT,
 		MSG_ABOUT_CONSOLE,
 		MSG_PROMPT_LOGIN,
 		MSG_PROMPT_REGISTER,
@@ -392,7 +394,6 @@ public:
 		messages[MSG_ALREADY_LOGGED] = "Already logged in.";
 		messages[MSG_DUPLICATE_NAME] = "Duplicate nickname – kicked.";
 		messages[MSG_SPECTATOR_NO_LOGIN] = "Spectator mode – no login needed.";
-		messages[MSG_MAP_CHANGING_KICK] = "Map is changing, please rejoin.";
 		messages[MSG_LOGIN_TIMEOUT] = "Login timeout. Rejoin and try again.";
 		messages[MSG_ADMIN_ONLY] = "Admins only.";
 		messages[MSG_CUSTOM_INFO] = "%s";
@@ -400,7 +401,7 @@ public:
 		messages[MSG_NOT_REGISTERED] = "Not registered. Use /register <password>";
 		messages[MSG_ALREADY_REG] = "Already registered. Use /login <password>";
 		messages[MSG_LOGIN_ATTEMPTS] = "Wrong password. Attempt %d of %d.";
-		messages[MSG_TOO_MANY_ATTEMPTS] = "Too many fails – %sed.";
+		messages[MSG_TOO_MANY_ATTEMPTS] = "Too many fails";
 		messages[MSG_PW_TOO_SHORT] = "Password too short (min %d chars).";
 		messages[MSG_PW_TOO_LONG] = "Password too long (max %d chars).";
 		messages[MSG_REG_DISABLED_TEMP] = "Registration temporarily disabled.";
@@ -409,8 +410,7 @@ public:
 		messages[MSG_IP_CHANGED] = "IP changed – please log in manually.";
 		messages[MSG_CHAT_COOLDOWN] = "Please wait before sending another message.";
 		messages[MSG_RECOVERY_NOT_IMPL] = "Recovery not implemented yet.";
-		messages[MSG_HELP_TEXT] = "Commands: /login <pw> /register <pw> /passwd <new> /autologin /info /about";
-		messages[MSG_ABOUT_CONSOLE] = "VcLogin v4.8 by Floxen | Discord: swipesznx6 | https://pavelkalas.cz";
+		messages[MSG_ABOUT_CONSOLE] = "VcLogin v5.1 by Floxen | Discord: swipesznx6 | https://pavelkalas.cz";
 		messages[MSG_PROMPT_LOGIN] = "Press T and type /login <password>";
 		messages[MSG_PROMPT_REGISTER] = "Press T and type /register <password>";
 		messages[MSG_RECOVERY_INVALID] = "Invalid recovery code.";
@@ -677,133 +677,6 @@ public:
 };
 
 // ============================================================================
-// PlayerManager – přístup do paměti hry
-// ============================================================================
-class PlayerManager {
-	std::unordered_set<int> playersFromRecovery;
-
-	bool IsPointerValid(void* ptr, size_t size = sizeof(void*)) const noexcept {
-		return ptr && !IsBadReadPtr(ptr, (UINT_PTR)size);
-	}
-	uintptr_t* GetPlayerList() const noexcept {
-		return (uintptr_t*)((uintptr_t)g_gameDLL + 0x7AE9C8);
-	}
-	int* GetPlayerCount() const noexcept {
-		return (int*)((uintptr_t)g_gameDLL + 0x80C770);
-	}
-public:
-	bool IsOnline(int id) const {
-		int* cnt = GetPlayerCount(); uintptr_t* list = GetPlayerList();
-		if (!IsPointerValid(cnt) || !IsPointerValid(list)) return false;
-		for (int i = 0; i < *cnt; ++i) {
-			int* pid = (int*)list[i];
-			if (IsPointerValid(pid) && *pid == id) return true;
-		}
-		return false;
-	}
-	bool IsLogged(int id) const {
-		int* cnt = GetPlayerCount(); uintptr_t* list = GetPlayerList();
-		if (!IsPointerValid(cnt) || !IsPointerValid(list)) return false;
-		for (int i = 0; i < *cnt; ++i) {
-			uintptr_t base = list[i];
-			int* pid = (int*)base;
-			int* block = (int*)(base + 0xC);
-			if (IsPointerValid(pid) && *pid == id && IsPointerValid(block)) return *block > 0;
-		}
-		return false;
-	}
-	std::string GetPlayerName(int id) const {
-		int* cnt = GetPlayerCount(); uintptr_t* list = GetPlayerList();
-		if (!IsPointerValid(cnt) || !IsPointerValid(list)) return {};
-		for (int i = 0; i < *cnt; ++i) {
-			uintptr_t base = list[i];
-			int* pid = (int*)base;
-			char* name = (char*)(base + 0x28);
-			if (IsPointerValid(pid) && *pid == id && IsPointerValid(name, 1))
-				return std::string(name, strnlen(name, 32));
-		}
-		return {};
-	}
-	void SetCommander(int id) {
-		int* cnt = GetPlayerCount(); uintptr_t* list = GetPlayerList();
-		if (!IsPointerValid(cnt) || !IsPointerValid(list)) return;
-		for (int i = 0; i < *cnt; ++i) {
-			int* pid = (int*)list[i];
-			int* classif = (int*)(list[i] + 0x1C);
-			if (IsPointerValid(pid) && IsPointerValid(classif) && *pid == id) { *classif = 0; break; }
-		}
-	}
-	bool BlockPlayerUntilFound(int id, DWORD timeoutMs = 2000) {
-		auto start = std::chrono::steady_clock::now();
-		while (true) {
-			int* cnt = GetPlayerCount(); uintptr_t* list = GetPlayerList();
-			if (IsPointerValid(cnt) && IsPointerValid(list)) {
-				for (int i = 0; i < *cnt; ++i) {
-					int* pid = (int*)list[i];
-					int* block = (int*)(list[i] + 0xC);
-					if (IsPointerValid(pid) && *pid == id && IsPointerValid(block)) { *block = 0; return true; }
-				}
-			}
-			if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() >= timeoutMs) break;
-			Sleep(1);
-		}
-		return false;
-	}
-	void AllowPlayer(int id) {
-		int* cnt = GetPlayerCount(); uintptr_t* list = GetPlayerList();
-		if (!IsPointerValid(cnt) || !IsPointerValid(list)) return;
-		for (int i = 0; i < *cnt; ++i) {
-			uintptr_t base = list[i];
-			int* pid = (int*)base;
-			int* block = (int*)(base + 0xC);
-			if (IsPointerValid(pid) && *pid == id && IsPointerValid(block)) { *block = 19; break; }
-		}
-	}
-	bool IsSpectator(int id) const {
-		int* cnt = GetPlayerCount(); uintptr_t* list = GetPlayerList();
-		if (!IsPointerValid(cnt) || !IsPointerValid(list)) return false;
-		for (int i = 0; i < *cnt; ++i) {
-			int* pid = (int*)list[i];
-			int* mode = (int*)(list[i] + 0x1C);
-			if (IsPointerValid(pid) && *pid == id && IsPointerValid(mode)) return *mode == 0;
-		}
-		return false;
-	}
-	bool IsDuplicateName(const std::string& name) const {
-		int* cnt = GetPlayerCount(); uintptr_t* list = GetPlayerList();
-		if (!IsPointerValid(cnt) || !IsPointerValid(list)) return false;
-		int found = 0;
-		for (int i = 0; i < *cnt; ++i) {
-			char* pname = (char*)(list[i] + 0x28);
-			if (IsPointerValid(pname, 1) && name == pname) found++;
-		}
-		return found > 1;
-	}
-	void KickAllNotLogged() const {
-		int* cnt = GetPlayerCount(); uintptr_t* list = GetPlayerList();
-		if (!IsPointerValid(cnt) || !IsPointerValid(list)) return;
-		for (int i = 0; i < *cnt; ++i) {
-			int* block = (int*)(list[i] + 0xC);
-			int* pid = (int*)list[i];
-			if (IsPointerValid(block) && IsPointerValid(pid) && *block == 0)
-				SendCommand(("kick " + std::to_string(*pid)).c_str());
-		}
-	}
-	bool IsAdmin(const std::string& name) const {
-		CreateFileIfNotExists(ADMIN_FILE);
-		std::ifstream f(ADMIN_FILE); std::string line;
-		while (std::getline(f, line)) if (line == name) return true;
-		return false;
-	}
-	std::string ExtractIpFromLine(const std::string& line) const {
-		std::regex ipPat(R"((\d{1,3}\.){3}\d{1,3})");
-		std::smatch m;
-		if (std::regex_search(line, m, ipPat)) return m.str();
-		return {};
-	}
-};
-
-// ============================================================================
 // Síťové funkce (odesílání zpráv)
 // ============================================================================
 void SendMessageToPlayer(int targetId, const char* text, int fromId) {
@@ -850,11 +723,115 @@ unsigned int SendCommand(const char* command) {
 	return copyLen;
 }
 
-void SendCommandRepeated(const char* cmd, int times, int waitMs) {
-	for (int i = 0; i < times; ++i) { SendCommand(cmd); Sleep(waitMs); }
-}
+// ============================================================================
+// PlayerManager – přístup do paměti hry
+// ============================================================================
+class PlayerManager {
+	std::unordered_set<int> playersFromRecovery;
 
-bool IsMapChanging() { return *(bool*)((uintptr_t)g_gameDLL + 0x777F6C); }
+	bool IsPointerValid(void* ptr, size_t size = sizeof(void*)) const noexcept {
+		return ptr && !IsBadReadPtr(ptr, (UINT_PTR)size);
+	}
+	uintptr_t* GetPlayerList() const noexcept {
+		return (uintptr_t*)((uintptr_t)g_gameDLL + 0x7AE9C8);
+	}
+	int* GetPlayerCount() const noexcept {
+		return (int*)((uintptr_t)g_gameDLL + 0x80C770);
+	}
+public:
+	void KickPlayer(int id) {
+		char packetData[2];
+		packetData[0] = 77;
+		packetData[1] = 8;
+		SendConsoleMessageToPlayer(id, "Server closed connection.");
+		SendMessageToRemoteClient(id, packetData, 2u, 1, 0.0);
+	}
+	bool IsOnline(int id) const {
+		int* cnt = GetPlayerCount(); uintptr_t* list = GetPlayerList();
+		if (!IsPointerValid(cnt) || !IsPointerValid(list)) return false;
+		for (int i = 0; i < *cnt; ++i) {
+			int* pid = (int*)list[i];
+			if (IsPointerValid(pid) && *pid == id) return true;
+		}
+		return false;
+	}
+	bool IsLogged(int id) const {
+		int* cnt = GetPlayerCount(); uintptr_t* list = GetPlayerList();
+		if (!IsPointerValid(cnt) || !IsPointerValid(list)) return false;
+		for (int i = 0; i < *cnt; ++i) {
+			uintptr_t base = list[i];
+			int* pid = (int*)base;
+			int* block = (int*)(base + 0xC);
+			if (IsPointerValid(pid) && *pid == id && IsPointerValid(block)) return *block > 0;
+		}
+		return false;
+	}
+	std::string GetPlayerName(int id) const {
+		int* cnt = GetPlayerCount(); uintptr_t* list = GetPlayerList();
+		if (!IsPointerValid(cnt) || !IsPointerValid(list)) return {};
+		for (int i = 0; i < *cnt; ++i) {
+			uintptr_t base = list[i];
+			int* pid = (int*)base;
+			char* name = (char*)(base + 0x28);
+			if (IsPointerValid(pid) && *pid == id && IsPointerValid(name, 1))
+				return std::string(name, strnlen(name, 32));
+		}
+		return {};
+	}
+	void AllowPlayer(int id) {
+		int* cnt = GetPlayerCount(); uintptr_t* list = GetPlayerList();
+		if (!IsPointerValid(cnt) || !IsPointerValid(list)) return;
+		for (int i = 0; i < *cnt; ++i) {
+			uintptr_t base = list[i];
+			int* pid = (int*)base;
+			int* block = (int*)(base + 0xC);
+			if (IsPointerValid(pid) && *pid == id && IsPointerValid(block)) { *block = 19; break; }
+		}
+	}
+	bool IsSpectator(int id) const {
+		int* cnt = GetPlayerCount(); uintptr_t* list = GetPlayerList();
+		if (!IsPointerValid(cnt) || !IsPointerValid(list)) return false;
+		for (int i = 0; i < *cnt; ++i) {
+			int* pid = (int*)list[i];
+			int* mode = (int*)(list[i] + 0x1C);
+			if (IsPointerValid(pid) && *pid == id && IsPointerValid(mode)) return *mode == 0;
+		}
+		return false;
+	}
+	bool IsDuplicateName(const std::string& name) const {
+		int* cnt = GetPlayerCount(); uintptr_t* list = GetPlayerList();
+		if (!IsPointerValid(cnt) || !IsPointerValid(list)) return false;
+		int found = 0;
+		for (int i = 0; i < *cnt; ++i) {
+			char* pname = (char*)(list[i] + 0x28);
+			if (IsPointerValid(pname, 1) && name == pname) found++;
+		}
+		return found > 1;
+	}
+	void KickAllNotLogged() {
+		int* cnt = GetPlayerCount(); uintptr_t* list = GetPlayerList();
+		if (!IsPointerValid(cnt) || !IsPointerValid(list)) return;
+		for (int i = 0; i < *cnt; ++i) {
+			int* block = (int*)(list[i] + 0xC);
+			int* pid = (int*)list[i];
+			if (IsPointerValid(block) && IsPointerValid(pid) && *block == 0) {
+				KickPlayer(*pid);
+			}
+		}
+	}
+	bool IsAdmin(const std::string& name) const {
+		CreateFileIfNotExists(ADMIN_FILE);
+		std::ifstream f(ADMIN_FILE); std::string line;
+		while (std::getline(f, line)) if (line == name) return true;
+		return false;
+	}
+	std::string ExtractIpFromLine(const std::string& line) const {
+		std::regex ipPat(R"((\d{1,3}\.){3}\d{1,3})");
+		std::smatch m;
+		if (std::regex_search(line, m, ipPat)) return m.str();
+		return {};
+	}
+};
 
 // ============================================================================
 // CommandHandler – zpracování příkazů
@@ -925,7 +902,17 @@ private:
 		return true;
 	}
 	bool Help(int id) {
-		SendMessageToPlayer(id, msg->GetRaw(MessageManager::MSG_HELP_TEXT).c_str(), 2);
+		SendMessageToPlayer(id, "Info printed to console.", 2);
+		SendConsoleMessageToPlayer(id, "");
+		SendConsoleMessageToPlayer(id, "> Commands:");
+		SendConsoleMessageToPlayer(id, "");
+		SendConsoleMessageToPlayer(id, "/login [password] - Log you to server as user");
+		SendConsoleMessageToPlayer(id, "/register [password] - Register you as new user to server");
+		SendConsoleMessageToPlayer(id, "/passwd [new password] - Changes a password to your account");
+		SendConsoleMessageToPlayer(id, "/autologin - Use this when you don't want use your password");
+		SendConsoleMessageToPlayer(id, "/info - Shows user's defined string");
+		SendConsoleMessageToPlayer(id, "/about - Shows info about this software");
+		SendConsoleMessageToPlayer(id, "");
 		return true;
 	}
 	bool Info(int id) {
@@ -1018,14 +1005,8 @@ private:
 			std::lock_guard<std::mutex> lock(g_failedLoginsMutex);
 			int attempts = ++g_failedLoginAttemptsPerPlayer[pname];
 			if (attempts >= maxAttempts) {
-				std::string penalty = ini->GetValue("tries_penalty_level");
-				if (penalty != "ban" && penalty != "kick") penalty = "kick";
-				SendMessageToPlayer(id, msg->Get(MessageManager::MSG_TOO_MANY_ATTEMPTS, penalty.c_str()).c_str(), 1);
-				g_failedLoginAttemptsPerPlayer.erase(pname);
-				std::string cmdStr = (penalty == "ban") ? "ban " + std::to_string(id) + " 1" : "kick " + std::to_string(id);
-				std::thread([cmdStr]() {
-					for (int i = 0; i < 2; ++i) { SendCommand(cmdStr.c_str()); Sleep(500); }
-					}).detach();
+				SendMessageToPlayer(id, msg->Get(MessageManager::MSG_TOO_MANY_ATTEMPTS).c_str(), 1);
+				pm->KickPlayer(id);
 			}
 			else {
 				SendMessageToPlayer(id, msg->Get(MessageManager::MSG_LOGIN_ATTEMPTS, attempts, maxAttempts).c_str(), 2);
@@ -1109,9 +1090,11 @@ public:
 			Sleep(50);
 		}
 	}
-private:
+	bool IsProcessedAID(int id) {
+		int aid = GetPlayerAidById(id);
+		return processedAIDs.find(aid) != processedAIDs.end();
+	}
 	void OnNewPlayer(const std::string& pname, const std::string& ip, int pid) {
-		pm->BlockPlayerUntilFound(pid, 2000);
 		if (pm->IsSpectator(pid) && pname.find("Spectator(") != std::string::npos) {
 			SendMessageToPlayer(pid, msg->GetRaw(MessageManager::MSG_SPECTATOR_NO_LOGIN).c_str(), 1);
 			pm->AllowPlayer(pid);
@@ -1119,11 +1102,9 @@ private:
 		}
 		if (pm->IsDuplicateName(pname)) {
 			SendMessageToPlayer(pid, msg->GetRaw(MessageManager::MSG_DUPLICATE_NAME).c_str(), 1);
-			SendCommandRepeated(("kick " + std::to_string(pid)).c_str(), 2, 400);
+			pm->KickPlayer(pid);
 			return;
 		}
-		if (pm->IsAdmin(pname))
-			pm->SetCommander(pid);
 		std::string oldIp = pdb->GetIpByPlayerName(pname);
 		if (!oldIp.empty()) {
 			if (ip == oldIp) {
@@ -1134,11 +1115,6 @@ private:
 			else {
 				SendMessageToPlayer(pid, msg->GetRaw(MessageManager::MSG_IP_CHANGED).c_str(), 1);
 			}
-		}
-		if (IsMapChanging()) {
-			SendMessageToPlayer(pid, msg->GetRaw(MessageManager::MSG_MAP_CHANGING_KICK).c_str(), 1);
-			SendCommandRepeated(("kick " + std::to_string(pid)).c_str(), 2, 400);
-			return;
 		}
 		if (pm->IsOnline(pid)) {
 			int plid = pid;
@@ -1158,10 +1134,36 @@ private:
 				}
 				if (!ppm->IsLogged(plid) && ppm->IsOnline(plid)) {
 					SendMessageToPlayer(plid, pmsg->GetRaw(MessageManager::MSG_LOGIN_TIMEOUT).c_str(), 1);
-					SendCommandRepeated(("kick " + std::to_string(plid)).c_str(), 2, 500);
+					ppm->KickPlayer(plid);
 				}
 				}).detach();
 		}
+	}
+private:
+	int GetPlayerAidById(int targetId)
+	{
+		int* playerCount = (int*)((uintptr_t)g_gameDLL + 0x7BF210);
+
+		if (!playerCount || *playerCount <= 0)
+			return 0;
+
+		float* unitDataPtr = (float*)((uintptr_t)g_gameDLL + 0x7BF244);
+
+		if (!unitDataPtr)
+			return 0;
+
+		for (int i = 0; i < *playerCount; ++i)
+		{
+			int aid = *(((DWORD*)unitDataPtr) - 11);
+			int id = *(((DWORD*)unitDataPtr) - 10);
+
+			if (id == targetId)
+				return aid;
+
+			unitDataPtr += 16;
+		}
+
+		return 0;
 	}
 	void ScanPlayers() {
 		int* playerCount = (int*)((uintptr_t)g_gameDLL + 0x7BF210);
@@ -1187,7 +1189,7 @@ private:
 					std::thread([pid]() {
 						SendConsoleMessageToPlayer(pid, "");
 						Sleep(50);
-						SendConsoleMessageToPlayer(pid, "> VcLogin v4.8 Community edition active - https://PavelKalas.cz (Floxen)");
+						SendConsoleMessageToPlayer(pid, "> VcLogin v5.1 Community edition active - https://PavelKalas.cz (Floxen)");
 						Sleep(50);
 						SendConsoleMessageToPlayer(pid, "");
 						}).detach();
@@ -1198,9 +1200,6 @@ private:
 				const char* name = (nameAddr) ? (const char*)(nameAddr + 40) : nullptr;
 				if (name && name[0] != 0) {
 					processedAIDs.insert(aid);
-					char ip[128] = { 0 };
-					GetClientAddress((void*)id, (int)ip, sizeof(ip));
-					OnNewPlayer(std::string(name), std::string(ip), id);
 				}
 			}
 			unitDataPtr += 16;
@@ -1214,22 +1213,6 @@ private:
 		}
 	}
 };
-
-// ============================================================================
-// MapChangeMonitor
-// ============================================================================
-static void MapChangeMonitor() {
-	bool last = IsMapChanging();
-	while (true) {
-		bool cur = IsMapChanging();
-		if (last != cur && cur) {
-			Sleep(100);
-			if (g_playerManager) g_playerManager->KickAllNotLogged();
-		}
-		last = cur;
-		Sleep(200);
-	}
-}
 
 // ============================================================================
 // ReadBitsAligned (pomocná)
@@ -1297,6 +1280,23 @@ static void __stdcall OnMessageRenderHook(int id, wchar_t* prefix, int msgConten
 	OriginalOnMessageRender(id, prefix, msgContent, cbfIndex, isHost);
 }
 
+static DWORD* __cdecl OnPlayerCreateHook(int* playerStruct, int playerId) {
+	if (!g_playerConnectionWatcher->IsProcessedAID(playerId)) {
+		*playerStruct = 0;
+		thread createPlayer([playerId, playerStruct] {
+			Sleep(200);
+			char ip[128] = { 0 };
+			if (GetClientAddress((void*)playerId, (int)ip, sizeof(ip))) {
+				const char* name = (const char*)playerStruct + 6;
+				g_playerConnectionWatcher->OnNewPlayer(std::string(name), std::string(ip), playerId);
+			}
+			});
+		createPlayer.detach();
+	}
+
+	return OnPlayerCreate(playerStruct, playerId);
+}
+
 // ============================================================================
 // Generování klíče
 // ============================================================================
@@ -1325,9 +1325,20 @@ std::string LoadOrCreateEncryptionKey() {
 // Hlavní vlákno DLL
 // ============================================================================
 DWORD WINAPI MainThread(LPVOID) {
-	g_gameDLL = GetModuleHandleA("game.dll");
-	g_logsDLL = GetModuleHandleA("logs.dll");
+	while (!(g_gameDLL = GetModuleHandleA("game.dll"))) {
+		Sleep(100);
+	}
+
+	while (!(g_logsDLL = GetModuleHandleA("logs.dll"))) {
+		Sleep(100);
+	}
+
+	Sleep(500);
+
 	if (!g_gameDLL || !g_logsDLL) return 0;
+	// AllocConsole();
+	// FILE* file;
+	// freopen_s(&file, "CONOUT$", "w", stdout);
 
 	CreateDefaultConfigIfMissing();
 
@@ -1362,7 +1373,8 @@ DWORD WINAPI MainThread(LPVOID) {
 	WriteBitsAligned = (WriteBitsAligned_t)((uintptr_t)g_gameDLL + 0x14B160);
 	SendMessageToRemoteClient = (SendMessageToRemoteClient_t)((uintptr_t)g_gameDLL + 0x14B800);
 	GetClientAddress = (GetClientAddress_t)((uintptr_t)g_gameDLL + 0x169E00);
-	if (!OriginalOnMessage || !OriginalOnMessageRender || !WriteBitsAligned || !SendMessageToRemoteClient || !GetClientAddress)
+	OnPlayerCreate = (OnPlayerCreate_t)((uintptr_t)g_gameDLL + 0x14D2E0);
+	if (!OriginalOnMessage || !OriginalOnMessageRender || !WriteBitsAligned || !SendMessageToRemoteClient || !GetClientAddress || !OnPlayerCreate)
 		return 0;
 
 	g_commandHandler = new CommandHandler(pm, pdb, ini, msg);
@@ -1375,15 +1387,24 @@ DWORD WINAPI MainThread(LPVOID) {
 	DetourUpdateThread(GetCurrentThread());
 	DetourAttach(&(PVOID&)OriginalOnMessage, OnMessageHook);
 	DetourAttach(&(PVOID&)OriginalOnMessageRender, OnMessageRenderHook);
+	DetourAttach(&(PVOID&)OnPlayerCreate, OnPlayerCreateHook);
 	DetourTransactionCommit();
 
 	_beginthreadex(NULL, 0, [](void*)->unsigned { HookMonitor(NULL); return 0; }, NULL, 0, NULL);
-	_beginthreadex(NULL, 0, [](void*)->unsigned { MapChangeMonitor(); return 0; }, NULL, 0, NULL);
-	CreateThread(NULL, 0, [](LPVOID lpParam) -> DWORD WINAPI {
-		auto* watcher = static_cast<PlayerConnectionWatcher*>(lpParam);
-		watcher->Start();
-		return 0;
-		}, new PlayerConnectionWatcher(pm, pdb, msg), 0, NULL);
+	g_playerConnectionWatcher = new PlayerConnectionWatcher(pm, pdb, msg);
+
+	CreateThread(
+		NULL,
+		0,
+		[](LPVOID lpParam) -> DWORD WINAPI {
+			auto* watcher = static_cast<PlayerConnectionWatcher*>(lpParam);
+			watcher->Start();
+			return 0;
+		},
+		g_playerConnectionWatcher,
+		0,
+		NULL
+	);
 
 	return 0;
 }
@@ -1391,8 +1412,11 @@ DWORD WINAPI MainThread(LPVOID) {
 // ============================================================================
 // Vstupní bod
 // ============================================================================
+int _launch = 0;
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
-	if (reason == DLL_PROCESS_ATTACH)
-		CreateThread(NULL, 0, MainThread, hModule, 0, NULL);
+	if (_launch++ == 0) {
+		if (reason == DLL_PROCESS_ATTACH)
+			CreateThread(NULL, 0, MainThread, hModule, 0, NULL);
+	}
 	return TRUE;
 }
