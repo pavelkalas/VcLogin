@@ -13,6 +13,7 @@ VcLogin introduces a full account-based authentication layer into the Vietcong 1
 ### Account System
 Players can register and manage accounts directly in-game using commands:
 
+```
 /register <password> – create account  
 /login <password> – authenticate account  
 /passwd <new_password> – change password  
@@ -22,6 +23,7 @@ Players can register and manage accounts directly in-game using commands:
 /help – command list  
 /about – plugin info  
 /disconnect - disconnects you from server
+```
 
 Accounts are stored in an encrypted database and permanently linked to nicknames.
 
@@ -64,7 +66,7 @@ spawndelay <0-30> – sets spawn delay for guest players in seconds (0 = no dela
 The system is configured via vclogin.ini. It controls database paths, password rules, guest mode behavior, chat cooldown and other server settings.
 
 Example configuration:
-
+```
 database_file = players.db  
 min_password_length = 4  
 max_password_length = 32  
@@ -73,7 +75,7 @@ chat_cooldown_time = 2
 guest_mode = 1  
 guest_mode_join_spawn_delay = 10  
 custom_message = Welcome to our server! ; If you liked this tool, share it.
-
+```
 ## Generated Files
 
 players.db – encrypted account database  
