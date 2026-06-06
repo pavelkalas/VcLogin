@@ -21,6 +21,7 @@ Players can register and manage accounts directly in-game using commands:
 /info – server info  
 /help – command list  
 /about – plugin info  
+/disconnect - disconnects you from server
 
 Accounts are stored in an encrypted database and permanently linked to nicknames.
 
