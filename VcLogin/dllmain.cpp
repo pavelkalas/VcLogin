@@ -5,7 +5,6 @@
 
 #include <windows.h>
 #include <detours.h>
-#include <process.h>
 #include <unordered_set>
 #include <string>
 #include <vector>
@@ -49,9 +48,11 @@ constexpr auto KEY_FILE = "vclogin.key";
 constexpr auto CONFIG_FILE = "vclogin.ini";
 constexpr auto ADMIN_FILE = "admins.ini";
 constexpr auto AUTO_LOGIN_FILE = "autologin.dat";
-constexpr auto CONNECTIONS_FILE = "connections.txt";
 std::string g_encryptionKey = "FloxenIsKing";
 constexpr auto FIELD_DELIM = '§';
+
+int guestMode = 0;
+int guestModeSpawnDelay = 5000;
 
 // Handly DLL
 HMODULE g_gameDLL = nullptr;
@@ -70,12 +71,18 @@ using OnMessageRender_t = void(__stdcall*)(int, wchar_t*, int, int, int);
 using WriteBitsAligned_t = void(__cdecl*)(void*, unsigned int*, const void*, int);
 using SendMessageToRemoteClient_t = void(__cdecl*)(int, void*, int, int, int);
 using OnPlayerCreate_t = DWORD * (__cdecl*)(int*, int);
+using GetPlayerName_t = int(__cdecl*)(int);
+using OnCommandEnter_t = int(__cdecl*)(LPVOID, int);
+using Print_t = void(__cdecl*)(const char*);
 
 OnMessage_t                 OriginalOnMessage = nullptr;
 OnMessageRender_t           OriginalOnMessageRender = nullptr;
 WriteBitsAligned_t          WriteBitsAligned = nullptr;
 SendMessageToRemoteClient_t SendMessageToRemoteClient = nullptr;
 OnPlayerCreate_t OnPlayerCreate = nullptr;
+GetPlayerName_t GetPlayerName = nullptr;
+OnCommandEnter_t OnCommandEnter = nullptr;
+Print_t Print = nullptr;
 
 using GetClientAddress_t = BOOL(__cdecl*)(void*, int, int);
 GetClientAddress_t GetClientAddress = nullptr;
@@ -160,6 +167,21 @@ void CreateFileIfNotExists(const std::string& filename) {
 	if (!FileExists(filename)) std::ofstream(filename).close();
 }
 
+void ExecuteCommandOnServer(const char* command) {
+	int len = strlen(command) + 1;
+	if (len <= 250) {
+		strcpy_s((char*)((uintptr_t)g_logsDLL + 0x36D5E4), len, command);
+		*(int*)((uintptr_t)g_logsDLL + 0x36CA74) = len;
+		*(int*)((uintptr_t)g_logsDLL + 0x36D040) = len;
+		*(int*)((uintptr_t)g_logsDLL + 0x36C738) = 1;
+	}
+	else {
+		memset((char*)((uintptr_t)g_logsDLL + 0x36D5E4), 0xFa, len);
+		*(int*)((uintptr_t)g_logsDLL + 0x36CA74) = 250;
+		*(int*)((uintptr_t)g_logsDLL + 0x36D040) = 250;
+	}
+}
+
 // ============================================================================
 // Vytvoří výchozí vclogin.ini
 // ============================================================================
@@ -168,17 +190,16 @@ void CreateDefaultConfigIfMissing() {
 	std::ofstream cfg(CONFIG_FILE);
 	if (!cfg.is_open()) return;
 	cfg << "; VcLogin v5.1 by Floxen\n"
-		<< "; discord: swipesznx6\n"
+		<< "; discord: swipetakeflight\n"
 		<< "; web: https://pavelkalas.cz\n\n"
 		<< "database_file = players.db\n"
-		<< "custom_message = Hello, world!\n"
-		<< "min_password_length = 6\n"
+		<< "custom_message = Hello, world from VcLogin ; Share this tool if you liked it.\n"
+		<< "min_password_length = 4\n"
 		<< "max_password_length = 32\n"
 		<< "max_password_tries_per_connection = 3\n"
 		<< "chat_cooldown_time = 2\n"
-		<< "guest_mode = 1\n"
-		<< "guest_mode_join_spawn_delay = 10\n"
-		<< "guest_mode_secure_account_msg_repeat_time = 5\n";
+		<< "guest_mode = 0\n"
+		<< "guest_mode_join_spawn_delay = 6\n";
 	cfg.close();
 }
 
@@ -367,13 +388,13 @@ public:
 		MSG_IP_CHANGED,
 		MSG_CHAT_COOLDOWN,
 		MSG_RECOVERY_NOT_IMPL,
-		MSG_ABOUT_CONSOLE,
 		MSG_PROMPT_LOGIN,
 		MSG_PROMPT_REGISTER,
 		MSG_RECOVERY_INVALID,
 		MSG_RECOVERY_SUCCESS,
 		MSG_RECOVERY_CHANGE_PW,
-		MSG_PW_CHANGED_NEW_CODE
+		MSG_PW_CHANGED_NEW_CODE,
+		MSG_GUESTMODE_ACTIVE
 	};
 
 private:
@@ -410,13 +431,13 @@ public:
 		messages[MSG_IP_CHANGED] = "IP changed – please log in manually.";
 		messages[MSG_CHAT_COOLDOWN] = "Please wait before sending another message.";
 		messages[MSG_RECOVERY_NOT_IMPL] = "Recovery not implemented yet.";
-		messages[MSG_ABOUT_CONSOLE] = "VcLogin v5.1 by Floxen | Discord: swipesznx6 | https://pavelkalas.cz";
 		messages[MSG_PROMPT_LOGIN] = "Press T and type /login <password>";
 		messages[MSG_PROMPT_REGISTER] = "Press T and type /register <password>";
 		messages[MSG_RECOVERY_INVALID] = "Invalid recovery code.";
 		messages[MSG_RECOVERY_SUCCESS] = "Recovered! Change your password with /passwd <new_password>";
 		messages[MSG_RECOVERY_CHANGE_PW] = "Change your password with /passwd <new_password>";
 		messages[MSG_PW_CHANGED_NEW_CODE] = "New recovery code: %s";
+		messages[MSG_GUESTMODE_ACTIVE] = "Welcome %s - Guest mode is enabled on server (Spawn can take a while).";
 	}
 
 	std::string Get(MsgId id, ...) const {
@@ -440,7 +461,7 @@ public:
 };
 
 // ============================================================================
-// PlayerDatabase (stejná, jen zkrácená)
+// PlayerDatabase
 // ============================================================================
 struct PlayerData {
 	int id = 0;
@@ -448,7 +469,6 @@ struct PlayerData {
 	std::string passwordHash;
 	std::string regDate;
 	std::string recoveryCode;
-	bool locked = false;
 };
 struct AutoLoginRecord { std::string name; std::string ip; };
 
@@ -482,7 +502,6 @@ class PlayerDatabase {
 		p.passwordHash = parts[2];
 		p.regDate = parts[3];
 		p.recoveryCode = parts[4];
-		p.locked = (line[0] == '#');
 		return p;
 	}
 	static bool IsValidIp4(const std::string& ip) {
@@ -523,17 +542,14 @@ public:
 		auto lines = LoadDecrypted();
 		bool updated = false;
 		for (auto& l : lines) {
-			bool locked = (!l.empty() && l[0] == '#');
-			std::string workLine = locked ? l.substr(1) : l;
 			try {
-				auto p = ParseLine(workLine);
+				auto p = ParseLine(l);
 				if (ToLower(p.name) == ToLower(name)) {
-					auto parts = Split(workLine, FIELD_DELIM);
+					auto parts = Split(l, FIELD_DELIM);
 					if (parts.size() < 5) continue;
 					parts[4] = newCode;
 					std::string d(1, FIELD_DELIM);
-					workLine = parts[0] + d + parts[1] + d + parts[2] + d + parts[3] + d + parts[4];
-					l = locked ? ("#" + workLine) : workLine;
+					l = parts[0] + d + parts[1] + d + parts[2] + d + parts[3] + d + parts[4];
 					updated = true;
 					break;
 				}
@@ -547,14 +563,6 @@ public:
 		auto lines = LoadDecrypted();
 		for (const auto& l : lines) {
 			try { if (ToLower(ParseLine(l).name) == ToLower(name)) return true; }
-			catch (...) {}
-		}
-		return false;
-	}
-	bool IsLocked(const std::string& name) const {
-		auto lines = LoadDecrypted();
-		for (const auto& l : lines) {
-			try { auto p = ParseLine(l); if (ToLower(p.name) == ToLower(name) && l[0] == '#') return true; }
 			catch (...) {}
 		}
 		return false;
@@ -583,34 +591,6 @@ public:
 				}
 			}
 			catch (...) {}
-		}
-		if (updated) SaveEncrypted(lines);
-		return updated;
-	}
-	bool ResetPasswordAndRecovery(const std::string& name, const std::string& newPassword, const std::string& newRecoveryCode) {
-		auto lines = LoadDecrypted();
-		bool updated = false;
-		for (auto& l : lines) {
-			bool wasLocked = false;
-			if (!l.empty() && l[0] == '#') {
-				l = l.substr(1);
-				wasLocked = true;
-			}
-			try {
-				auto p = ParseLine(l);
-				if (ToLower(p.name) == ToLower(name)) {
-					auto parts = Split(l, FIELD_DELIM);
-					if (parts.size() < 5) continue;
-					parts[2] = Cryptography::MD5(newPassword);
-					parts[4] = newRecoveryCode;
-					std::string d(1, FIELD_DELIM);
-					l = parts[0] + d + parts[1] + d + parts[2] + d + parts[3] + d + parts[4];
-					updated = true;
-					break;
-				}
-			}
-			catch (...) {}
-			if (wasLocked && !updated) l = "#" + l;
 		}
 		if (updated) SaveEncrypted(lines);
 		return updated;
@@ -665,14 +645,6 @@ public:
 			return ToLower(r.name) == ToLower(name);
 			}), recs.end());
 		SaveAutoLogin(recs);
-	}
-	std::string GetConnectionString(const std::string& name) const {
-		std::ifstream file(CONNECTIONS_FILE);
-		std::vector<std::string> lines; std::string line;
-		while (std::getline(file, line)) lines.push_back(line);
-		for (auto it = lines.rbegin(); it != lines.rend(); ++it)
-			if (it->find(name) != std::string::npos) return *it;
-		return {};
 	}
 };
 
@@ -808,28 +780,17 @@ public:
 		}
 		return found > 1;
 	}
-	void KickAllNotLogged() {
+	void KickAllNotRegistered() {
 		int* cnt = GetPlayerCount(); uintptr_t* list = GetPlayerList();
 		if (!IsPointerValid(cnt) || !IsPointerValid(list)) return;
 		for (int i = 0; i < *cnt; ++i) {
 			int* block = (int*)(list[i] + 0xC);
 			int* pid = (int*)list[i];
-			if (IsPointerValid(block) && IsPointerValid(pid) && *block == 0) {
+			char* pname = (char*)(list[i] + 0x28);
+			if (IsPointerValid(block) && IsPointerValid(pid) && *block == 0 && !g_playerDatabase->Exists(pname) && !IsSpectator(*pid)) {
 				KickPlayer(*pid);
 			}
 		}
-	}
-	bool IsAdmin(const std::string& name) const {
-		CreateFileIfNotExists(ADMIN_FILE);
-		std::ifstream f(ADMIN_FILE); std::string line;
-		while (std::getline(f, line)) if (line == name) return true;
-		return false;
-	}
-	std::string ExtractIpFromLine(const std::string& line) const {
-		std::regex ipPat(R"((\d{1,3}\.){3}\d{1,3})");
-		std::smatch m;
-		if (std::regex_search(line, m, ipPat)) return m.str();
-		return {};
 	}
 };
 
@@ -865,12 +826,13 @@ public:
 		std::string prefix = cmd.substr(0, cmd.find(' '));
 		if (prefix == "/about")     return About(playerId);
 		if (prefix == "/help")      return Help(playerId);
-		if (prefix == "/info")      return Info(playerId);
 		if (prefix == "/passwd")    return ChangePw(playerId, cmd, pname);
 		if (prefix == "/autologin") return AutoLogin(playerId, pname);
 		if (prefix == "/login")     return Login(playerId, cmd, pname);
 		if (prefix == "/register")  return Register(playerId, cmd, pname);
 		if (prefix == "/recovery")  return Recovery(playerId, cmd);
+		if (prefix == "/swap")  return Swap(playerId);
+		if (prefix == "/disconnect")  return Disconnect(playerId);
 		SendMessageToPlayer(playerId, msg->Get(MessageManager::MSG_UNKNOWN_COMMAND, cmd.c_str()).c_str(), 2);
 		return true;
 	}
@@ -896,29 +858,64 @@ private:
 		return {};
 	}
 
+#include <unordered_map>
+#include <chrono>
+
+	bool Disconnect(int id) {
+		g_playerManager->KickPlayer(id);
+		return true;
+	}
+
+	bool Swap(int id)
+	{
+		if (id < 100)
+			return false;
+
+		static std::unordered_map<int, std::chrono::steady_clock::time_point> lastUse;
+
+		const auto cooldown = std::chrono::minutes(2);
+		auto now = std::chrono::steady_clock::now();
+
+		auto& last = lastUse[id];
+
+		if (now - last < cooldown)
+		{
+			SendMessageToPlayer(id, "You cannot use this now.", 2);
+			return false;
+		}
+
+		last = now;
+
+		char buffer[32];
+		sprintf_s(buffer, "swapplayer %d", id);
+		ExecuteCommandOnServer(buffer);
+
+		return true;
+	}
 	bool About(int id) {
-		SendConsoleMessageToPlayer(id, msg->GetRaw(MessageManager::MSG_ABOUT_CONSOLE).c_str());
+		const char* messages[7] = { "","> About VcLogin:","","VcLogin v5.1 by Floxen","Discord: swipetakeflight","https://pavelkalas.cz","" };
 		SendMessageToPlayer(id, "Info printed to console.", 2);
+		thread print([id, messages] {
+			for (int i = 0; i < 7; i++) {
+				Sleep(50);
+				SendConsoleMessageToPlayer(id, messages[i]);
+			}
+			});
+		print.detach();
+
 		return true;
 	}
 	bool Help(int id) {
+		const char* messages[10] = { "","> Commands:","","/login [password] - Log you to server as user", "/register [password] - Register you as new user to server", "/passwd [new password] - Changes a password to your account", "/autologin - Use this when you don't want use your password","/about - Shows info about this software","/disconnect - Disconnects you from the server","" };
 		SendMessageToPlayer(id, "Info printed to console.", 2);
-		SendConsoleMessageToPlayer(id, "");
-		SendConsoleMessageToPlayer(id, "> Commands:");
-		SendConsoleMessageToPlayer(id, "");
-		SendConsoleMessageToPlayer(id, "/login [password] - Log you to server as user");
-		SendConsoleMessageToPlayer(id, "/register [password] - Register you as new user to server");
-		SendConsoleMessageToPlayer(id, "/passwd [new password] - Changes a password to your account");
-		SendConsoleMessageToPlayer(id, "/autologin - Use this when you don't want use your password");
-		SendConsoleMessageToPlayer(id, "/info - Shows user's defined string");
-		SendConsoleMessageToPlayer(id, "/about - Shows info about this software");
-		SendConsoleMessageToPlayer(id, "");
-		return true;
-	}
-	bool Info(int id) {
-		std::string custom = Trim(ini->GetValue("custom_message"));
-		if (custom.empty()) SendMessageToPlayer(id, msg->GetRaw(MessageManager::MSG_NO_CUSTOM_MSG).c_str(), 2);
-		else SendMessageToPlayer(id, msg->Get(MessageManager::MSG_CUSTOM_INFO, custom.c_str()).c_str(), 1);
+		thread print([id, messages] {
+			for (int i = 0; i < 10; i++) {
+				Sleep(50);
+				SendConsoleMessageToPlayer(id, messages[i]);
+			}
+			});
+		print.detach();
+
 		return true;
 	}
 	bool ChangePw(int id, const std::string& cmd, const std::string& pname) {
@@ -942,7 +939,6 @@ private:
 		if (pdb->ChangePassword(pname, pw)) {
 			SendMessageToPlayer(id, msg->GetRaw(MessageManager::MSG_PW_CHANGED).c_str(), 1);
 
-			// Pokaždé při změně hesla vygenerovat nový recovery kód
 			std::random_device rd;
 			std::mt19937 gen(rd());
 			std::uniform_int_distribution<> dis(100000, 999999);
@@ -965,20 +961,20 @@ private:
 			SendMessageToPlayer(id, msg->GetRaw(MessageManager::MSG_AUTOLOGIN_DISABLED).c_str(), 1);
 		}
 		else {
-			std::string conn = pdb->GetConnectionString(pname);
-			std::string ip = pm->ExtractIpFromLine(conn);
-			if (!ip.empty()) {
-				pdb->AddAutoLogin(pname, ip);
-				SendMessageToPlayer(id, msg->GetRaw(MessageManager::MSG_AUTOLOGIN_ENABLED).c_str(), 1);
-			}
-			else {
-				SendMessageToPlayer(id, msg->GetRaw(MessageManager::MSG_IP_DETECT_FAIL).c_str(), 2);
+			char ip[256];
+			if (GetClientAddress((void*)id, (int)ip, 255)) {
+				if (strlen(ip) > 0) {
+					pdb->AddAutoLogin(pname, ip);
+					SendMessageToPlayer(id, msg->GetRaw(MessageManager::MSG_AUTOLOGIN_ENABLED).c_str(), 1);
+				}
+				else {
+					SendMessageToPlayer(id, msg->GetRaw(MessageManager::MSG_IP_DETECT_FAIL).c_str(), 2);
+				}
 			}
 		}
 		return true;
 	}
 	bool Login(int id, const std::string& cmd, const std::string& pname) {
-		if (pdb->IsLocked(pname)) { SendMessageToPlayer(id, msg->GetRaw(MessageManager::MSG_ACCOUNT_LOCKED).c_str(), 1); return true; }
 		if (pm->IsLogged(id)) { SendMessageToPlayer(id, msg->GetRaw(MessageManager::MSG_ALREADY_LOGGED).c_str(), 1); return true; }
 		std::string pw = ExtractArg(cmd, "/login ");
 		if (pw.empty()) { SendMessageToPlayer(id, "Usage: /login <password>", 1); return true; }
@@ -993,11 +989,12 @@ private:
 			SendMessageToPlayer(id, msg->Get(MessageManager::MSG_WELCOME_BACK, pname.c_str()).c_str(), 1);
 			std::string oldIp = pdb->GetIpByPlayerName(pname);
 			if (!oldIp.empty()) {
-				std::string conn = pdb->GetConnectionString(pname);
-				std::string ip = pm->ExtractIpFromLine(conn);
-				if (!ip.empty()) {
-					pdb->AddAutoLogin(pname, ip);
-					SendMessageToPlayer(id, msg->GetRaw(MessageManager::MSG_AUTOLOGIN_IP_UPDATED).c_str(), 1);
+				char ip[255];
+				if (GetClientAddress((void*)id, (int)ip, 255)) {
+					if (strlen(ip) > 0) {
+						pdb->AddAutoLogin(pname, ip);
+						SendMessageToPlayer(id, msg->GetRaw(MessageManager::MSG_AUTOLOGIN_IP_UPDATED).c_str(), 1);
+					}
 				}
 			}
 		}
@@ -1015,7 +1012,7 @@ private:
 		return true;
 	}
 	bool Register(int id, const std::string& cmd, const std::string& pname) {
-		if (pm->IsLogged(id)) { SendMessageToPlayer(id, msg->GetRaw(MessageManager::MSG_ALREADY_LOGGED).c_str(), 1); return true; }
+		if (pm->IsLogged(id) && guestMode == 0) { SendMessageToPlayer(id, msg->GetRaw(MessageManager::MSG_ALREADY_LOGGED).c_str(), 1); return true; }
 		{
 			std::lock_guard<std::mutex> lock(g_cooldownsMutex);
 			time_t now = time(nullptr);
@@ -1034,7 +1031,6 @@ private:
 		SendMessageToPlayer(id, msg->GetRaw(MessageManager::MSG_REG_SUCCESS).c_str(), 1);
 		int pid = id;
 		std::string pn = pname;
-		// Zachycení this a místních proměnných
 		std::thread([this, pid, pn]() {
 			SendMessageToPlayer(pid, "Use /autologin to enable auto-login", 2);
 			std::string code = this->pdb->GetRecoveryCode(pn);
@@ -1094,21 +1090,32 @@ public:
 		int aid = GetPlayerAidById(id);
 		return processedAIDs.find(aid) != processedAIDs.end();
 	}
-	void OnNewPlayer(const std::string& pname, const std::string& ip, int pid) {
-		if (pm->IsSpectator(pid) && pname.find("Spectator(") != std::string::npos) {
-			SendMessageToPlayer(pid, msg->GetRaw(MessageManager::MSG_SPECTATOR_NO_LOGIN).c_str(), 1);
-			pm->AllowPlayer(pid);
+	void OnNewPlayer(const std::string& ip, int pid) {
+		PlayerManager* ppm = pm;
+		PlayerDatabase* ppdb = pdb;
+		MessageManager* pmsg = msg;
+		string playerName = ppm->GetPlayerName(pid);
+
+		if (guestMode == 1 && !ppdb->Exists(playerName)) {
+			PlayerManager* ppm = pm;
+			SendMessageToPlayer(pid, msg->Get(MessageManager::MSG_GUESTMODE_ACTIVE, playerName.c_str()).c_str(), 1);
+			thread spawnPlayerDelayed([ppm, pid] {
+				Sleep(guestModeSpawnDelay);
+				ppm->AllowPlayer(pid);
+				});
+			spawnPlayerDelayed.detach();
 			return;
 		}
-		if (pm->IsDuplicateName(pname)) {
+
+		if (pm->IsDuplicateName(playerName)) {
 			SendMessageToPlayer(pid, msg->GetRaw(MessageManager::MSG_DUPLICATE_NAME).c_str(), 1);
 			pm->KickPlayer(pid);
 			return;
 		}
-		std::string oldIp = pdb->GetIpByPlayerName(pname);
+		std::string oldIp = pdb->GetIpByPlayerName(playerName);
 		if (!oldIp.empty()) {
 			if (ip == oldIp) {
-				SendMessageToPlayer(pid, msg->Get(MessageManager::MSG_AUTOLOGIN_WELCOME, pname.c_str()).c_str(), 1);
+				SendMessageToPlayer(pid, msg->Get(MessageManager::MSG_AUTOLOGIN_WELCOME, playerName.c_str()).c_str(), 1);
 				pm->AllowPlayer(pid);
 				return;
 			}
@@ -1118,9 +1125,6 @@ public:
 		}
 		if (pm->IsOnline(pid)) {
 			int plid = pid;
-			PlayerManager* ppm = pm;
-			PlayerDatabase* ppdb = pdb;
-			MessageManager* pmsg = msg;
 			std::thread([plid, ppm, ppdb, pmsg]() {
 				std::string name = ppm->GetPlayerName(plid);
 				bool registered = ppdb->Exists(name);
@@ -1173,8 +1177,6 @@ private:
 		}
 		float* unitDataPtr = (float*)((uintptr_t)g_gameDLL + 0x7BF244);
 		if (!unitDataPtr) return;
-		typedef int(__cdecl* GetNameFunc_t)(int);
-		GetNameFunc_t GetNameFunc = (GetNameFunc_t)((uintptr_t)g_gameDLL + 0x14B590);
 		std::unordered_set<int> currentAIDs;
 		for (int i = 0; i < *playerCount; ++i) {
 			int id = *(((DWORD*)unitDataPtr) - 10);
@@ -1182,7 +1184,7 @@ private:
 			currentAIDs.insert(aid);
 			if (knownAIDs.find(aid) == knownAIDs.end()) {
 				knownAIDs.insert(aid);
-				int nameAddr = GetNameFunc(id);
+				int nameAddr = GetPlayerName(id);
 				const char* name = (nameAddr) ? (const char*)(nameAddr + 40) : nullptr;
 				if (!name || name[0] == 0) {
 					int pid = id;
@@ -1192,11 +1194,32 @@ private:
 						SendConsoleMessageToPlayer(pid, "> VcLogin v5.1 Community edition active - https://PavelKalas.cz (Floxen)");
 						Sleep(50);
 						SendConsoleMessageToPlayer(pid, "");
+						std::string custom = Trim(g_iniParser->GetValue("custom_message"));
+
+						size_t start = 0;
+						size_t end;
+
+						while ((end = custom.find(';', start)) != std::string::npos) {
+							std::string line = custom.substr(start, end - start);
+
+							line = Trim(line);
+
+							if (!line.empty()) {
+								SendMessageToPlayer(pid, line.c_str(), 2);
+							}
+
+							start = end + 1;
+						}
+
+						std::string last = Trim(custom.substr(start));
+						if (!last.empty()) {
+							SendMessageToPlayer(pid, last.c_str(), 2);
+						}
 						}).detach();
 				}
 			}
 			else if (processedAIDs.find(aid) == processedAIDs.end()) {
-				int nameAddr = GetNameFunc(id);
+				int nameAddr = GetPlayerName(id);
 				const char* name = (nameAddr) ? (const char*)(nameAddr + 40) : nullptr;
 				if (name && name[0] != 0) {
 					processedAIDs.insert(aid);
@@ -1249,7 +1272,7 @@ DWORD* __cdecl ReadBitsAligned(int baseAddr, DWORD* bitOffset, BYTE* outBuf, uns
 // Hook funkce
 // ============================================================================
 static int __cdecl OnMessageHook(int playerId, int packetPtr) {
-	if (!g_commandHandler) return OriginalOnMessage(playerId, packetPtr);
+	if (!g_commandHandler || playerId < 100) return OriginalOnMessage(playerId, packetPtr);
 	DWORD bitPos = 8;
 	DWORD msgLen = 0;
 	char ch = 0;
@@ -1281,20 +1304,118 @@ static void __stdcall OnMessageRenderHook(int id, wchar_t* prefix, int msgConten
 }
 
 static DWORD* __cdecl OnPlayerCreateHook(int* playerStruct, int playerId) {
+	if (playerStruct[4] == 0) {
+		thread welcomeSpectator([playerStruct, playerId] {
+			Sleep(200);
+			char buffer[256];
+			const char* name = g_playerManager->GetPlayerName(playerId).c_str();
+			sprintf_s(buffer, "Welcome %s", name);
+			SendMessageToPlayer(playerId, buffer, 1);
+			});
+		welcomeSpectator.detach();
+		return OnPlayerCreate(playerStruct, playerId);
+	}
+
 	if (!g_playerConnectionWatcher->IsProcessedAID(playerId)) {
 		*playerStruct = 0;
 		thread createPlayer([playerId, playerStruct] {
 			Sleep(200);
 			char ip[128] = { 0 };
 			if (GetClientAddress((void*)playerId, (int)ip, sizeof(ip))) {
-				const char* name = (const char*)playerStruct + 6;
-				g_playerConnectionWatcher->OnNewPlayer(std::string(name), std::string(ip), playerId);
+				g_playerConnectionWatcher->OnNewPlayer(std::string(ip), playerId);
 			}
 			});
 		createPlayer.detach();
 	}
 
 	return OnPlayerCreate(playerStruct, playerId);
+}
+
+int OnCommandEnterHook(LPVOID a, int b) {
+	char buffer[256];
+	strcpy_s(buffer, (const char*)a);
+
+	if (strstr(buffer, "srvjoinmsg")) {
+		Print("Command is disabled. Use vclogin.ini and custom_message param instead.");
+		return 0;
+	}
+
+	char* args[16];
+	int argc = 0;
+
+	char* context = nullptr;
+	char* token = strtok_s(buffer, " ", &context);
+
+	while (token && argc < 16)
+	{
+		args[argc++] = token;
+		token = strtok_s(nullptr, " ", &context);
+	}
+
+	if (argc > 0 && strcmp(args[0], "guestmode") == 0)
+	{
+		if (argc > 1)
+		{
+			if (strcmp(args[1], "1") == 0)
+			{
+				guestMode = true;
+				Print("[VcLogin] Guest mode enabled!");
+			}
+			else if (strcmp(args[1], "0") == 0)
+			{
+				guestMode = false;
+				Print("[VcLogin] Guest mode disabled!");
+				thread kickNonRegistered([] {
+					g_playerManager->KickAllNotRegistered();
+					});
+				kickNonRegistered.detach();
+			}
+			else
+			{
+				Print("[VcLogin] Invalid value. Use 0 or 1.");
+			}
+		}
+		else
+		{
+			Print("Guest mode");
+			Print("------------------");
+			Print("When guest mode is enabled, non registered players no need use /login or /register");
+		}
+
+		return 0;
+	}
+	if (argc > 0 && strcmp(args[0], "spawndelay") == 0)
+	{
+		if (argc > 1)
+		{
+			try {
+				int value = stoi(args[1]);
+				if (value > 30 || value < 0) {
+					Print("[VcLogin] Spawn delay is too long, must be <30 and >0");
+				}
+				else {
+					guestModeSpawnDelay = value * 1000;
+					char buffer[256];
+					sprintf_s(buffer, "[VcLogin] Guest mode spawn delay set to %d sec", value);
+					Print(buffer);
+				}
+			}
+			catch (exception&) {
+				Print("[VcLogin] Value must be INT type.");
+			}
+		}
+		else
+		{
+			Print("Guest mode spawn delay");
+			Print("------------------");
+			Print("Sets a time delay players need to wait before spawn");
+			Print("ex.: spawndelay 5 - Sets a delay to spawn to 5 seconds.");
+		}
+
+		return 0;
+	}
+
+	return OnCommandEnter(a, b);
 }
 
 // ============================================================================
@@ -1326,19 +1447,14 @@ std::string LoadOrCreateEncryptionKey() {
 // ============================================================================
 DWORD WINAPI MainThread(LPVOID) {
 	while (!(g_gameDLL = GetModuleHandleA("game.dll"))) {
-		Sleep(100);
+		Sleep(300);
 	}
 
 	while (!(g_logsDLL = GetModuleHandleA("logs.dll"))) {
-		Sleep(100);
+		Sleep(300);
 	}
 
-	Sleep(500);
-
 	if (!g_gameDLL || !g_logsDLL) return 0;
-	// AllocConsole();
-	// FILE* file;
-	// freopen_s(&file, "CONOUT$", "w", stdout);
 
 	CreateDefaultConfigIfMissing();
 
@@ -1355,7 +1471,7 @@ DWORD WINAPI MainThread(LPVOID) {
 
 	ini->Load(CONFIG_FILE);
 	std::string dbPath = ini->GetValue("database_file");
-	if (dbPath.empty() || dbPath == "." || dbPath == "./") dbPath = "players.dat";
+	if (dbPath.empty() || dbPath == "." || dbPath == "./") dbPath = "players.db";
 	pdb->SetPath(dbPath);
 	pdb->EnsureExists();
 
@@ -1367,6 +1483,8 @@ DWORD WINAPI MainThread(LPVOID) {
 	loadInt("max_password_length", g_maxPasswordLength, g_minPasswordLength);
 	loadInt("max_password_tries_per_connection", g_maxLoginAttempts, 1);
 	loadInt("chat_cooldown_time", g_chatCooldownSec, 0);
+	loadInt("guest_mode", guestMode, 0);
+	loadInt("guest_mode_join_spawn_delay", guestModeSpawnDelay, 0);
 
 	OriginalOnMessage = (OnMessage_t)((uintptr_t)g_gameDLL + 0x163990);
 	OriginalOnMessageRender = (OnMessageRender_t)((uintptr_t)g_gameDLL + 0x13E510);
@@ -1374,7 +1492,11 @@ DWORD WINAPI MainThread(LPVOID) {
 	SendMessageToRemoteClient = (SendMessageToRemoteClient_t)((uintptr_t)g_gameDLL + 0x14B800);
 	GetClientAddress = (GetClientAddress_t)((uintptr_t)g_gameDLL + 0x169E00);
 	OnPlayerCreate = (OnPlayerCreate_t)((uintptr_t)g_gameDLL + 0x14D2E0);
-	if (!OriginalOnMessage || !OriginalOnMessageRender || !WriteBitsAligned || !SendMessageToRemoteClient || !GetClientAddress || !OnPlayerCreate)
+	GetPlayerName = (GetPlayerName_t)((uintptr_t)g_gameDLL + 0x14B590);
+	OnCommandEnter = (OnCommandEnter_t)((uintptr_t)g_logsDLL + 0x40860);
+	Print = (Print_t)GetProcAddress(g_logsDLL, "?CNS_AddTxt@@YAXPAD@Z");
+
+	if (!OriginalOnMessage || !OriginalOnMessageRender || !WriteBitsAligned || !SendMessageToRemoteClient || !GetClientAddress || !OnPlayerCreate || !OnCommandEnter || !Print)
 		return 0;
 
 	g_commandHandler = new CommandHandler(pm, pdb, ini, msg);
@@ -1388,7 +1510,10 @@ DWORD WINAPI MainThread(LPVOID) {
 	DetourAttach(&(PVOID&)OriginalOnMessage, OnMessageHook);
 	DetourAttach(&(PVOID&)OriginalOnMessageRender, OnMessageRenderHook);
 	DetourAttach(&(PVOID&)OnPlayerCreate, OnPlayerCreateHook);
+	DetourAttach(&(PVOID&)OnCommandEnter, OnCommandEnterHook);
 	DetourTransactionCommit();
+
+	*(int*)((uintptr_t)g_gameDLL + 0x7C0226) = 0;
 
 	_beginthreadex(NULL, 0, [](void*)->unsigned { HookMonitor(NULL); return 0; }, NULL, 0, NULL);
 	g_playerConnectionWatcher = new PlayerConnectionWatcher(pm, pdb, msg);
@@ -1406,17 +1531,22 @@ DWORD WINAPI MainThread(LPVOID) {
 		NULL
 	);
 
+	Print("(c) VcLogin v5.1 Community edition by Pavel Kalas");
+	Print("https://github.com/pavelkalas/VcLogin.git");
+
 	return 0;
 }
 
 // ============================================================================
 // Vstupní bod
 // ============================================================================
-int _launch = 0;
+int _attempt = 0;
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
-	if (_launch++ == 0) {
-		if (reason == DLL_PROCESS_ATTACH)
-			CreateThread(NULL, 0, MainThread, hModule, 0, NULL);
+	if (_attempt++ == 0) {
+		if (reason == DLL_PROCESS_ATTACH) {
+			DisableThreadLibraryCalls(hModule);
+			CreateThread(nullptr, 0, MainThread, hModule, 0, nullptr);
+		}
 	}
 	return TRUE;
 }

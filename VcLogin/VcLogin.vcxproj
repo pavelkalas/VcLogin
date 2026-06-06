@@ -76,7 +76,7 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <OutDir>C:\Games\Vietcong\</OutDir>
-    <TargetName>dpnhpast</TargetName>
+    <TargetName>dpnhpast1</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <OutDir>C:\Games\Vietcong\plugins</OutDir>
